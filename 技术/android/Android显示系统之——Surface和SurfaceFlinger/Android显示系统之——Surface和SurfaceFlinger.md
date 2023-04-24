@@ -267,6 +267,144 @@ SurfaceFlinger 执行合成的流程如下：
 
 
 
+Garphics框架结构梳理
+1 Overview
+ 
+图1.1 Graphics整体框架
+Android屏幕显示的机制通过向FrameBuffer写入内容来实现。如果只有一个FB，当APP写入速度>LCD显示速度时没问题；当APP写入速度<=LCD显示速度时，会卡顿和闪烁，为了解决这个问题，一般采用2个以上FB。对于Android系统来说，有很多个APP，如果这些APP同时向FB写入内容那显示的内容就乱了，因此通过SurfaceFlinger来管理。下图是Graphics的核心组件。
+ 
+图1.2 Graphics的核心组件
+	图像流生产者（Image Steam Producers）：一个图像流生产者表示可以产生图像buffer的任何组件。例如包括OpenGL ES、Canvas 2D和媒体服务器视频解码器。
+	图像流消费者（Image Stream Consumers）：大部分情况下，通常的图像流消费者是SurfaceFlinger，SF是一个系统服务用于消费当前的可见surface并且将他们合成到display，前提是使用Window Manager提供的参数。SurfaceFlinger是唯一可以修改显示内容的服务。SurfaceFlinger使用OpenGL和HWC来来合成一组surface。其他的OpenGL ES应用也可以消耗图像流，例如Camera app消耗了camera预览图像流。非GL应用程序也可以是消费者，例如ImageReader类。
+	窗口管理器（Window Manager）：控制窗口的Android系统服务，窗口是view的容器。一个窗口总是对应一个surface。这个服务监督窗口的生命周期，输入和焦点事件，屏幕方向，透明度，动画，位置，形变，z-order等等。窗口管理器发送所有的window元数据到SurfaceFlinger，从而SF可以使用这些数据来合成surface。
+	硬件合成器（Hardware Composer）：显示子系统的硬件抽象。SurfaceFlinger可以授权一些特定的合成工作到硬件合成器，从而降低OpenGL和GPU的工作负担。
+	图形内存分配器（Gralloc）：用于分配图像生成器请求的内存。
+2 Framework Graphics
+2.1 SurfaceFlinger
+SurfaceFlinger是一个重要的系统服务，也是Android系统的一个关键进程，它最重要的作用就是合成surface，能够将不同应用的2D或者3D surface进行合成。通过底层的操作将合成后的数据发送到显示设备，最终显示在屏上。主要代码目录：frameworks/native/services/SurfaceFlinger。SurfaceFlinger主要做以下几件事情：
+	给App提供buffer：通过gralloc模块向ashmen申请内存得到文件句柄fd，将fd通过binder机制传递给对应的app，app再执行mmap操作即可获得对应的buffer，如图2.1.1所示。
+	将app发来的buffer（界面数据）进行合成：根据各个界面的layer（Z值，由WindowManager Service确定，如图2.1.2所示），把排序后的整体buffer传递给HardwareComposer。然后到Display环节，分为DPU合成和GSP合成，显示架构主要是DRM架构，最后输出到LCD上显示，该方式为HWC合成（Device）。
+	通过Hardware UI绘制，由View确定。绘制部分通过OpenGL和Vulkan实现，App也可以直接调用EGL层接口来实现渲染功能，该方式为GPU合成（Client）。
+ 
+图2.1.1 SurfaceFlinger整体框架
+ 
+图2.1.2 合成surface示意图
+2.1.1 Composition
+SurfaceFlinger作为合成器，它分为GPU合成（Client）和HWC合成（Device）两种方式，根据不同场景和GSP/DPU能力去决定具体合成方式到HWComposer HAL，合成方式选择见表2.1，HWComposer根据具体场景和硬件能力返回SurfaceFlinger改变的compotionType作为最终结果。SurfaceFlinger在收集可见层的所有缓冲区之后，便会询问Hardware Composer应如何进行合成。
+表2.1.1 SurfaceFlinger合成方式
+合成方式	类型	描述
+Device	Device	普通图层
+	SolidColor	固定色，主要是透明效果
+Client	Cusor	鼠标小箭头
+	Client	GPU合成
+Device合成是用专门的硬件合成器进行合成HWComposer，所以硬件合成的能力就取决于硬件的实现。其合成方式是将各个Layer的数据全部传给显示硬件，并告知它从不同的缓冲区读取屏幕不同部分的数据。HWComposer是Device合成的抽象。
+Client合成方式是相对与硬件合成来说的，其合成方式是，将各个Layer的内容用GPU渲染到暂存缓冲区中，最后将暂存缓冲区传送到显示硬件。这个暂存缓冲区，我们称为FBTarget，每个Display设备有各自的FBTarget。Client合成，之前称为GLES合成，我们也可以称之为GPU合成。Client合成，采用RenderEngine进行合成。
+2.1.2 Region
+ 
+图2.1.3 各显示区域之间的关系
+在Android系统中，定义了Region（一块任意形状的图形）的概念，它代表屏幕上的一个区域，它是由一个或多个Rect（矩形方块）组成的，这个区域有三种状态，可能是不可见的、部分可见的或者完全不可见的。图2.1.3中damage区域表示经常更新的区域。
+2.1.3 Vsync
+Vsync（Vertical Synchronization，垂直同步）是一种在PC上很早就广泛使用的技术，可以理解为是一种定时中断。SurfaceFlinger合成时机和app绘制时机都受到Vsync控制，Vsync也是分析是否掉帧的关键点。Android系统每隔16ms发出VSYNC信号，触发对UI进行渲染，屏幕的刷新过程是每一行从左到右（行刷新，水平刷新，Horizontal Scanning），从上到下（屏幕刷新，垂直刷新，Vertical Scanning）。当整个屏幕刷新完毕，即一个垂直刷新周期完成，会有短暂的空白期，此时发出VSync信号。
+当没有VSync机制时，以下图为例，第一个16ms之内一切正常。第二个16ms之内因为CPU最后阶段才计算出了数据，导致GPU也是在第二段的末尾时间才进行了绘制，整个动作延后到了第三段内，从而影响了下一个画面的绘制。这时会出现Jank（闪烁，可以理解为卡顿或者停顿）。此时CPU和GPU可能被其他操作占用了，这就是卡顿出现的原因。
+ 
+图2.1.4 没有VSync机制
+当使用Vsync同步时，收到Vsync命令的时候，CPU和GPU才会必须立刻进行刷新/显示的动作。CPU/GPU接收vsync信号提前准备下一帧要显示的内容，所以能够及时准备好每一帧的数据，保证画面的流畅。如下所示：
+ 
+图2.1.5 有VSync机制
+当系统资源紧张性能降低时，导致GPU在处理某帧数据时太耗时，在Vsync信号到来时，buffer B的数据还没准备好，此时不得不显示buffer A的数据，这样导致后面CPU/GPU没有新的buffer准备数据，如下图，如果GPU忙不过来了，没有能及时完成，又会导致Jank，如下所示：
+ 
+图2.1.6 系统资源紧张性能紧张时VSync机制
+空白时间无事可做，后面Jank频出，因此又引入了triple buffering，如下所示：
+ 
+图2.1.7 系统资源紧张性能紧张时triple buffering机制
+当出现上面所述情况后，新增一个buffer C 可以减少CPU和GPU在Vsync同步间的空白间隙，此时CPU/GPU能够利用buffer C继续工作，后面buffer A 和 buffer B 依次处理下一帧数据。这样仅是产生了一个Jank，可以忽略不计，以后的流程就顺畅了。 
+要注意以下2点：
+	在多数正常情况下还是使用二级缓冲机制，三级缓冲只是在需要的时候才使用。
+	三级缓冲并不是解决了jank的问题，而是出现jank时不影响后续的显示。
+虽然vsync使得CPU/GPU/Display同步了，但App UI和SurfaceFlinger的工作显然是一个流水线的模型。即对于一帧内容，先等App UI画完了，SurfaceFlinger再出场对其进行合并渲染后放入framebuffer，最后整到屏幕上。而现有的VSync模型是让大家一起开始干活，这样对于同一帧内容，第一个VSync信号时App UI的数据开始准备，第二个VSync信号时SurfaceFlinger工作，第三个VSync信号时用户看到Display内容，这样就两个VSync period（每个16ms）过去了，影响用户体验。
+解决这个问题的思路是：SurfaceFlinger在App UI准备好数据后及时开工做合成。Android 4.4（KitKat）中引入了VSync的虚拟化，即把硬件的VSync信号先同步到一个本地VSync模型中，再从中一分为二，引出两条VSync时间与之有固定偏移的线程。即App开始工作的时候是Vsync+offset1，surface工作的时刻在Vsync+offset1+offset2。而这个offset1和offset2都是可调的。示意图如下：
+ 
+图2.1.8 VSync的虚拟化
+产生Vsync的源头主要是硬件（HardwareComposer，一般）或者软件（VsyncThread）；由线程（DispSyncThread）来虚拟化Vsync信号，将Vsync分为Vsync-APP和Vsync-Surface，Vsync-App和Vsync-Surface是按需起作用的。
+ 
+图2.1.9 APP需要更新界面和SF合成界面流程图
+当APP需要更新界面时，发送请求Vsync信号请求给EventThread（APP），EventThread（APP）再向DispSyncThread线程发送请求，DispSyncThread线程收到请求后，延迟offset1后将VSync-APP发送给EventThread（APP）并唤醒，EventThread（APP）在收到Vsync-APP后唤醒APP，APP开始产生新界面（dequeueBuffer操作）。
+APP将产生的界面提交Buffer时会调用queueBuffer的操作，最后会通知SF合成界面。SF需要合成界面的时候，发送请求Vsync信号请求给EventThread（SF），EventThread（SF）再向DispSyncThread线程发送请求，DispSyncThread线程收到请求后，延迟offset2后将Vsync-SF发送给EventThread（SF）并唤醒，EventThread（SF）在收到Vsync-SF后唤醒SF，SF开始合成新界面。
+2.2 GraphicBuffer
+2.2.1 BufferQueue
+BufferQueue类将可生成图形数据缓冲区的组件（producers）连接到接受数据以便进行显示或进一步处理的组件（consumers）。几乎所有在系统中移动图形数据缓冲区的内容都依赖于BufferQueue。
+Android显示系统是一个典型的生产者——消费者模式，其中，上层（APP）负责生产，而下层负责消费，而在其中每一层之间所传递的数据载体就是GraphicBuffer（图形缓冲区），而GraphicBuffer通过Gralloc进行申请。BufferQueue在Android图形组件之间起到粘合作用。这是一对queue，用于实现从生产者到消费者的恒定循环。一旦生产者交出buffer，SurfaceFlinger就承担起将所有东西合成到display的责任。下图是BufferQueue的通信过程。
+ 
+图2.2.1 BufferQueue的通信过程
+BufferQueue包含把图像流生产者和图像流消费者绑定到一起的逻辑。一些图像生产者的例子是camera预览，是由camera HAL或者OpenGL ES产生的。一些图像消费者的例子是SurfaceFlinger或者某些显示OpenGL ES流的app，例如camera app显示camera取景器（viewfinder）。BufferQueue是一个将buffer池（pool）和一个队列组合在一起的数据结构，并且使用Binder IPC来传递buffer。BufferQueue通常用于渲染到Surface、使用GL Consumer来消耗等其他任务。下图为Android的图形数据流，左侧是渲染器生产的graphics buffer，例如home界面、状态栏和system UI。SurfaceFlinger是排版者，HWC是合成者。
+ 
+图2.2.2 Android的图形数据流
+2.2.2 Fence
+Fence（栅栏）机制是一种资源同步机制，主要用于处理跨硬件场景，如CPU、GPU和HWC之间的buffer资源同步，即图形系统中GraphicBuffer的同步。可以将fence理解为一种资源锁。一组线程能够使用fence来集体进行相互同步。本质上每个线程在到达某种状态时调用fence的wait()方法，阻塞等待其他全部参与线程调用wait()方法表明它们也到达了这个状态。一旦全部的线程都到达fence，它们就会集体解除阻塞，并一起继续运行。Fence可以实现在producer和consumer对buffer处理的过程中是协调同步从而保证buffer内容准确且不会被篡改。从下图可以发现，一个buffer的状态变化是：Free—Dequeued—Queued—Acquired—Free。
+ 
+图2.2.3 Buffer状态变化
+接下来对Buffer的四种状态进行说明：
+	Buffer处于FREE状态时，producer并不能直接申请它，此时需要等一个signal（NO_FENCE信号），由于有可能上一次申请的buffer正在被consumer消费中，所以要等待consumer发出finish信号，此时FREE状态下的buffer就好像被栅栏fence拦住了，这里是用Fence中wait()或者waitForever()方法。等一个NO_FENCCE信号，栅栏fence就会打开。进入到下一流程。
+	Buffer处于DEQUEUED状态时，即producer申请的buffer从队列中出来但还没有进入队列或者取消buffer。这个状态下producer想向Buffer填入UI数据时，必须等一个NO_FENCE信号，因为有可能其它owner正在对它进行操作。当信号到达时poducer就能够对其进行操作，操作完毕后再发出一个NO_FENCE信号。
+	Buffer处于QUEUED状态时，即把buffer加入队列，在这个操作前必须等dequeueBuffer完毕之后发的NO_FENCE信号，收到信号后才进行入队列操作或者取消buffer操作。这个时候它的owner就变成BufferQueue了。
+	Buffer处于ACQUIRED状态时，即producer已经对buffer填充完毕，也要等一个NO_FENCE信号，然后consumer才干对其进行操作。操作完毕后会释放buffer，然后发出一个NO_FENCE信号。
+2.3 Hardware Composer
+2.3.1 Overview
+Composer作为一个独立的关键进程，主要作用是接收SurfaceFlinger传递过来的数据，采用合适的方式进行合成，并将framebuffer数据通过显示框架（如：DRM，ADF，FB等）送屏显示输出。与Gralloc一样，Composer作为HAL层，在Android版本升级时同样对它有严格的要求，需要升级到指定的版本，否则会导致XTS fail。
+HWC（HWComposer）是Android中进行窗口（Layer）合成和显示的HAL层模块（注意：不是SurfaceFlinger代码中HWComposer这个类），通常由显示设备制造商（OEM）实现并完成，为SurfaceFlinger服务提供硬件支持。SurfaceFlinger可以使用OpenGL ES合成Layer，这需要占用并消耗GPU资源。大多数GPU都没有针对图层合成进行优化，因此当SurfaceFlinger通过GPU合成图层时，应用程序无法使用GPU进行自己的渲染。而HWC通过硬件设备进行图层合成，可以减轻GPU的合成压力。
+2.3.2 HWC pipeline
+显示设备的能力千差万别，很难直接用API表示硬件设备支持合成的Layer数量，Layer是否可以进行旋转和混合模式操作，以及对图层定位和硬件合成的限制等。因此HWC描述上述信息的流程是这样的：
+	SurfaceFlinger向HWC提供所有Layer的完整列表，让HWC根据其硬件能力，决定如何处理这些Layer。
+	HWC会为每个Layer标注合成方式，表明是通过GPU还是通过HWC合成。
+	SurfaceFlinger负责先把所有注明GPU合成的Layer合成到一个输出Buffer，然后把这个输出Buffer和其他Layer（注明HWC合成的Layer）一起交给HWC，让HWC完成剩余Layer的合成和显示。
+2.3.3 HWC function
+每个HWC硬件模块都应该支持以下能力：
+	至少支持4个叠加层：状态栏、系统栏、应用本身和壁纸或者背景。
+	叠加层可以大于显示屏，例如：壁纸
+	同时支持预乘每像素（per-pixel）Alpha混合和每平面（per-plane）Alpha混合。
+	为了支持受保护的内容，必须提供受保护视频播放的硬件路径。
+	RGBA packing order, YUV formats, and tiling, swizzling, and stride properties
+	部分专业词汇说明：
+	Tiling：可以把Image切割成MxN个小块，最后渲染时，再将这些小块拼接起来，就像铺瓷砖一样。
+	Swizzling：一种拌和技术，表示向量单元可以被任意地重排或重复。
+2.4 HWUI
+HWUI硬件加速绘制模型，主要就是采用OpenGL来进行GPU硬件绘图，以此来提升绘图的速率，从而提高图形显示的性能。
+3 OpenGL&Vulkan
+OpenGL（Open Graphics Library）是用于渲染2D、3D矢量图形的跨语言、跨平台的应用程序编程接口（API）。
+Vulkan也是一个跨平台的2D和3D绘图应用程序接口（API）。相对于OpenGL，Vulkan可以节约大量的CPU开销，提升应用的性能。
+4 Debug
+	开发者选项中“停用HW叠加层”
+	dump SurfaceFlinger
+	截屏/录屏
+	dump layer和framebuffer
+	停用HWUI
+	抓取systrace
+	抓取Gapid/RenderDoc
+	SDK HierarchyView
+ 
+5 Graphics architecture
+5.1 Low-level components
+5.1.1 BufferQueue and gralloc
+BufferQueue将生成图形数据缓冲区的东西（生产者）连接到接受数据以供显示或进一步处理的东西（消费者）。缓冲区分配是通过gralloc内存分配器执行的，后者通过vendor-specific的HAL接口实现。
+5.1.2 SurfaceFlinger, Hardware Composer, and virtual displays
+SurfaceFlinger接受来自多个来源的数据缓冲区，将它们合成，并将它们发送给display。HWC确定可用硬件组合缓冲区的最有效方法，virtual displays使系统内的合成输出可用（记录屏幕或通过网络发送屏幕）。
+5.1.3 Surface, canvas, and SurfaceHolder
+Surface产生一个缓冲区队列，该队列通常由SurfaceFlinger消耗。当渲染到一个Surface上时，结果最终在一个缓冲区中被传送给consumer。Canvas API提供了一个软件实现（带有硬件加速支持），可以直接在表面上绘图（OpenGL ES的低级替代方案）。任何与视图有关的东西都涉及到一个SurfaceHolder，它的API允许获取和设置表面参数，比如大小和格式。
+5.1.4 EGLSurface and OpenGL ES
+OpenGL ES (GLES)定义了一个图形渲染API，旨在与EGL相结合，EGL是一个可以通过操作系统创建和访问窗口的库（绘制纹理多边形，使用GLES调用；在屏幕上呈现，使用EGL call）。
+5.1.5 Vulkan
+Vulkan是一个低开销、跨平台的高性能3D图形API。与OpenGL ES一样，Vulkan提供了在应用程序中创建高质量实时图形的工具。Vulkan的优点包括减少CPU开销和支持SPIR-V二进制中间语言。
+5.2 High-level components
+5.2.1 SurfaceView and GLSurfaceView
+SurfaceView结合了surface和view。SurfaceView的视图组件由SurfaceFlinger（而不是应用程序）合成，使渲染从一个单独的线程/进程和应用程序UI渲染隔离。GLSurfaceView提供了辅助类来管理EGL上下文、线程间通信和与活动生命周期的交互（但不需要使用GLES）。
+5.2.2 SurfaceTexture
+SurfaceTexture结合了surface和GLES texture来创建BufferQueue，app是它的消费者。当一个生产者将一个新的缓冲区放入队列时，它会通知app，然后app释放之前持有的缓冲区，从队列中获取新的缓冲区，并使EGL调用使缓冲区作为外部texture可供GLES使用。
+5.2.3 TextureView
+TextureView结合了view和SurfaceTexture。TextureView封装了一个SurfaceTexture，负责响应回调和获取新的缓冲区。绘图时，TextureView使用最近收到的缓冲区的内容作为数据源，在view状态指示的任何地方和方式呈现。视图组合总是使用GLES执行的，这意味着对内容的更新可能会导致其他视图元素也被重新绘制。
+Reference
+https://source.android.com/docs/core/graphics
+https://blog.csdn.net/vviccc/article/details/104860616
+
 
 
 
